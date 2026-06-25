@@ -1,0 +1,981 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Numerics;
+using System.Reflection;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using CurrencyRatioExchange.Utils;
+using ExileCore2;
+using ExileCore2.PoEMemory;
+using ExileCore2.PoEMemory.Components;
+using ExileCore2.PoEMemory.Elements;
+using ExileCore2.PoEMemory.Elements.Village;
+using ExileCore2.Shared.Enums;
+using ImGuiNET;
+
+namespace CurrencyRatioExchange
+{
+    public class CurrencyRatioExchange : BaseSettingsPlugin<CurrencyRatioExchangeSettings>
+    {
+        private string _amountInput = "";
+        private string _ratioInput = "";
+        private int _calculatedWant = 0;
+        private int _calculatedHave = 0;
+        private string _errorMessage = "";
+        private bool _hasValidResult = false;
+        private volatile bool _isProcessing = false;
+
+        // Fill status feedback (written from the fill task, read on the render thread)
+        private volatile string _statusMessage = "";
+        private volatile bool _statusOk = true;
+
+        // For quick-fill from competing trades
+        private int _quickFillWant = 0;
+        private int _quickFillHave = 0;
+
+        // Fill tuning (see Settings for the user-facing knobs)
+        private const int ClickFocusDelayMs = 100; // wait after each click for focus to settle
+        private const int ClearBackspaces = 10; // generous clear so large stacks are wiped
+        private const int VerifyTimeoutMs = 600; // how long to wait for memory to reflect a typed value
+        private const int VerifyPollMs = 30; // read-back poll interval
+        private const int CursorDriftThresholdSq = 100; // (10px)^2 — drift beyond this = user grabbed the mouse
+
+        // The Place Order button carries a child label with this text; we locate the button by
+        // searching for it (index paths into the panel proved unreliable across game states).
+        private const string PlaceOrderLabelText = "place order";
+
+        public override bool Initialise()
+        {
+            try
+            {
+                LogMessage("Currency Ratio Exchange initialized successfully!");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to initialize CurrencyRatioExchange: {ex.Message}");
+                return false;
+            }
+        }
+
+        public override void Render()
+        {
+            if (!Settings.Enable.Value)
+                return;
+
+            var currencyPanel = GameController.IngameState?.IngameUi?.CurrencyExchangePanel;
+            var currencyPicker = GameController
+                .IngameState
+                ?.IngameUi
+                ?.CurrencyExchangePanel
+                ?.CurrencyPicker;
+
+            if (currencyPanel == null || !currencyPanel.IsVisible || currencyPicker.IsVisible)
+                return;
+
+            if (!Settings.ShowCalculator.Value)
+                return;
+
+            // Position calculator overlay near the currency exchange panel
+            var panelRect = currencyPanel.GetClientRectCache;
+            ImGui.SetNextWindowPos(
+                new Vector2(panelRect.X + panelRect.Width + 10, panelRect.Y),
+                ImGuiCond.Always
+            );
+            ImGui.SetNextWindowSizeConstraints(new Vector2(460, 0), new Vector2(600, 2000));
+
+            ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.1f, 0.1f, 0.1f, 0.95f));
+            ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0.4f, 0.4f, 0.4f, 1.0f));
+
+            if (
+                ImGui.Begin(
+                    "Currency Ratio Calculator",
+                    ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.AlwaysAutoResize
+                )
+            )
+            {
+                // Amount Input
+                ImGui.Text("Currency Amount:");
+                ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - 50);
+                if (ImGui.InputText("##amount", ref _amountInput, 32))
+                {
+                    Calculate();
+                }
+                ImGui.SameLine();
+                int availableForFill = GetOfferedCurrencyAmount();
+                if (availableForFill > 0)
+                {
+                    if (ImGui.Button("Fill##fillAmount", new Vector2(42, 0)))
+                    {
+                        _amountInput = availableForFill.ToString();
+                        Calculate();
+                    }
+                    if (ImGui.IsItemHovered())
+                    {
+                        ImGui.SetTooltip($"Fill with available amount: {availableForFill}");
+                    }
+                }
+                else
+                {
+                    ImGui.BeginDisabled();
+                    ImGui.Button("Fill##fillAmount", new Vector2(42, 0));
+                    ImGui.EndDisabled();
+                    if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    {
+                        ImGui.SetTooltip("Select an offered currency first");
+                    }
+                }
+
+                // Ratio Input (Want:Have format)
+                ImGui.Text("Ratio (Want:Have, e.g., 1:3 or 2:5):");
+                ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - 50);
+                if (ImGui.InputText("##ratio", ref _ratioInput, 64))
+                {
+                    Calculate();
+                }
+                ImGui.SameLine();
+                if (ImGui.Button("Clear", new Vector2(42, 0)))
+                {
+                    _amountInput = "";
+                    _ratioInput = "";
+                    _hasValidResult = false;
+                    _errorMessage = "";
+                    _calculatedWant = 0;
+                    _calculatedHave = 0;
+                }
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip("Clear amount and ratio");
+                }
+
+                ImGui.Separator();
+
+                // Result Display
+                if (_hasValidResult)
+                {
+                    ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.2f, 1.0f, 0.2f, 1.0f));
+                    ImGui.TextWrapped("Result (Want : Have):");
+                    ImGui.PopStyleColor();
+
+                    ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1.0f, 1.0f, 0.2f, 1.0f));
+                    ImGui.SetWindowFontScale(1.5f);
+                    ImGui.Text($"{_calculatedWant} : {_calculatedHave}");
+                    ImGui.SetWindowFontScale(1.0f);
+                    ImGui.PopStyleColor();
+
+                    ImGui.Spacing();
+
+                    if (ImGui.Button("Fill Exchange Window", new Vector2(-1, 40)))
+                    {
+                        if (!_isProcessing)
+                        {
+                            _isProcessing = true;
+                            _ = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    await FillExchange(_calculatedWant, _calculatedHave);
+                                }
+                                finally
+                                {
+                                    _isProcessing = false;
+                                }
+                            });
+                        }
+                    }
+                }
+                else if (!string.IsNullOrEmpty(_errorMessage))
+                {
+                    ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1.0f, 0.2f, 0.2f, 1.0f));
+                    ImGui.TextWrapped($"Error: {_errorMessage}");
+                    ImGui.PopStyleColor();
+                }
+
+                RenderFillStatus();
+
+                ImGui.Spacing();
+                ImGui.Separator();
+                ImGui.TextWrapped(
+                    "Enter your currency amount and the ratio (Want:Have). The calculator finds the maximum whole trade with no leftovers."
+                );
+
+                ImGui.Spacing();
+                ImGui.Text("Examples:");
+                ImGui.BulletText("1:3 = 1 wanted per 3 offered");
+                ImGui.BulletText("2:5 = 2 wanted per 5 offered");
+
+                // Competing Trades Section
+                RenderCompetingTrades(Settings.ShowDebugInfo.Value);
+            }
+            ImGui.End();
+
+            ImGui.PopStyleColor(2);
+        }
+
+        private void RenderCompetingTrades(bool showDebug)
+        {
+            var currencyPanel = GameController.IngameState?.IngameUi?.CurrencyExchangePanel;
+            if (currencyPanel == null)
+                return;
+
+            var stockList = currencyPanel.OfferedItemStock;
+            if (stockList == null || !stockList.Any())
+                return;
+
+            var stockItems = stockList.ToList();
+
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.Spacing();
+
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.4f, 0.8f, 1.0f, 1.0f));
+            ImGui.Text("Competing Trades:");
+            ImGui.PopStyleColor();
+
+            ImGui.Spacing();
+
+            // Table header
+            ImGui.Columns(3, "competing_trades", true);
+            ImGui.SetColumnWidth(0, 80);
+            ImGui.SetColumnWidth(1, 60);
+            ImGui.SetColumnWidth(2, 300);
+
+            ImGui.Text("Ratio");
+            ImGui.NextColumn();
+            ImGui.Text("Listed");
+            ImGui.NextColumn();
+            ImGui.Text("Actions");
+            ImGui.NextColumn();
+            ImGui.Separator();
+
+            // Get player's available currency amount for the offered item
+            int availableAmount = GetOfferedCurrencyAmount();
+
+            int index = 0;
+            foreach (var stock in stockItems)
+            {
+                if (stock == null)
+                    continue;
+
+                // Keep as doubles to preserve ratio precision
+                double get = stock.Get;
+                double give = stock.Give;
+                int listed = (int)stock.ListedCount;
+
+                if (get <= 0 || give <= 0)
+                    continue;
+
+                // Display ratio matching in-game format
+                // In-game always displays the ratio with the larger value first (X:1 or 1:X where X >= 1)
+                // The stock's Get/Give values represent the raw trade amounts
+                string ratioDisplay;
+                if (give >= get)
+                {
+                    // give/get >= 1, display as X:1 (e.g., 2.20:1)
+                    double ratioValue = give / get;
+                    ratioDisplay = $"{ratioValue:F2}:1";
+                }
+                else
+                {
+                    // get/give > 1, display as 1:X (e.g., 1:1.33)
+                    double ratioValue = get / give;
+                    ratioDisplay = $"1:{ratioValue:F2}";
+                }
+
+                ImGui.Text(ratioDisplay);
+                ImGui.NextColumn();
+                ImGui.Text($"{listed}");
+                ImGui.NextColumn();
+
+                // Quick fill buttons
+                ImGui.PushID(index);
+
+                // Calculate actual fill amounts based on available currency
+                // - give = what we want to receive
+                // - get = what we have to offer
+                var (matchWant, matchHave) = CalculateFillAmounts(give, get, availableAmount);
+
+                if (matchHave > 0 && ImGui.SmallButton("Match"))
+                {
+                    QueueQuickFill(matchWant, matchHave);
+                }
+                else if (matchHave <= 0)
+                {
+                    ImGui.TextDisabled("Match");
+                }
+
+                // Undercut buttons with percentages
+                // Undercut means asking for LESS (reducing what you want/receive)
+                // This makes your listing more attractive to buyers
+                int[] undercutPercents = { 10, 20, 25, 30 };
+
+                foreach (var percent in undercutPercents)
+                {
+                    ImGui.SameLine();
+
+                    // Calculate undercut: reduce 'give' (what we receive) by the percentage
+                    double undercutGive = give * (1.0 - percent / 100.0);
+                    var (undercutWant, undercutHave) = CalculateFillAmounts(
+                        undercutGive,
+                        get,
+                        availableAmount
+                    );
+
+                    if (undercutHave > 0 && ImGui.SmallButton($"{percent}%"))
+                    {
+                        QueueQuickFill(undercutWant, undercutHave);
+                    }
+                    else if (undercutHave <= 0)
+                    {
+                        ImGui.TextDisabled($"{percent}%");
+                    }
+                }
+
+                ImGui.PopID();
+                ImGui.NextColumn();
+
+                index++;
+            }
+
+            // Show available amount
+            if (availableAmount > 0)
+            {
+                ImGui.Columns(1);
+                ImGui.Spacing();
+                ImGui.TextColored(
+                    new Vector4(0.6f, 0.6f, 0.6f, 1.0f),
+                    $"Available to trade: {availableAmount}"
+                );
+            }
+
+            ImGui.Columns(1);
+
+            // Debug: Show all properties of first stock item
+            if (showDebug && stockItems.Count > 0)
+            {
+                ImGui.Spacing();
+                ImGui.Separator();
+                ImGui.Text("Debug - First Stock Item Properties:");
+
+                var firstStock = stockItems[0];
+                if (firstStock != null)
+                {
+                    Type stockType = firstStock.GetType();
+                    ImGui.Text($"Type: {stockType.FullName}");
+
+                    foreach (
+                        var prop in stockType.GetProperties(
+                            BindingFlags.Public | BindingFlags.Instance
+                        )
+                    )
+                    {
+                        try
+                        {
+                            var value = prop.GetValue(firstStock);
+                            ImGui.Text($"  {prop.Name}: {value}");
+                        }
+                        catch
+                        {
+                            ImGui.Text($"  {prop.Name}: <error>");
+                        }
+                    }
+                }
+            }
+
+            // Process queued quick fill
+            if (_quickFillWant > 0 && _quickFillHave > 0 && !_isProcessing)
+            {
+                _isProcessing = true;
+                int want = _quickFillWant;
+                int have = _quickFillHave;
+                _quickFillWant = 0;
+                _quickFillHave = 0;
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await FillExchange(want, have);
+                    }
+                    finally
+                    {
+                        _isProcessing = false;
+                    }
+                });
+            }
+        }
+
+        private int GetOfferedCurrencyAmount()
+        {
+            try
+            {
+                var currencyPanel = GameController.IngameState?.IngameUi?.CurrencyExchangePanel;
+                if (currencyPanel == null)
+                    return 0;
+
+                var offeredItemType = currencyPanel.OfferedItemType;
+                if (offeredItemType == null)
+                    return 0;
+
+                string targetBaseName = offeredItemType.BaseName;
+                if (string.IsNullOrEmpty(targetBaseName))
+                    return 0;
+
+                int amount = 0;
+                var processedInventories = new HashSet<string>();
+
+                foreach (
+                    var playerInventory in GameController
+                        .IngameState
+                        .Data
+                        .ServerData
+                        .PlayerInventories
+                )
+                {
+                    var inventory = playerInventory?.Inventory;
+                    if (inventory?.Items == null)
+                        continue;
+
+                    // Avoid double counting with unique inventory key
+                    var inventoryKey = $"{inventory.InventType}_{inventory.Address}";
+                    if (!processedInventories.Add(inventoryKey))
+                        continue;
+
+                    foreach (var item in inventory.Items)
+                    {
+                        if (item == null)
+                            continue;
+
+                        var baseItemType = GameController.Files.BaseItemTypes.Translate(
+                            item.Metadata
+                        );
+                        if (baseItemType?.BaseName == targetBaseName)
+                        {
+                            var stackComp =
+                                item.GetComponent<ExileCore2.PoEMemory.Components.Stack>();
+                            amount += stackComp?.Size ?? 1;
+                        }
+                    }
+                }
+
+                return amount;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private (int want, int have) CalculateFillAmounts(
+            double wantPerUnit,
+            double havePerUnit,
+            int availableAmount
+        )
+        {
+            if (availableAmount <= 0 || wantPerUnit <= 0 || havePerUnit <= 0)
+                return (0, 0);
+
+            // Called with (give, get, availableAmount) from the stock item:
+            // - wantPerUnit = stock.Give = what WE receive per ratio unit
+            // - havePerUnit = stock.Get = what WE offer per ratio unit
+            //
+            // We want to maximize based on OUR available stock while maintaining the ratio.
+            // Use the ratio as a decimal and find the largest 'have' value where 'want' is whole.
+
+            double ratio = wantPerUnit / havePerUnit;
+
+            // Start from max available and find largest 'have' that produces whole 'want'
+            for (int have = availableAmount; have > 0; have--)
+            {
+                double wantExact = have * ratio;
+                int wantRounded = (int)Math.Round(wantExact);
+
+                // Check if it's effectively a whole number
+                if (wantRounded > 0 && Math.Abs(wantExact - wantRounded) < 0.001)
+                {
+                    return (wantRounded, have);
+                }
+            }
+
+            return (0, 0);
+        }
+
+        private void QueueQuickFill(int want, int have)
+        {
+            _quickFillWant = want;
+            _quickFillHave = have;
+        }
+
+        // ---- Hardened auto-fill -------------------------------------------------
+        // Single entry point for both the "Fill Exchange Window" button and the
+        // competing-trade quick-fill buttons. Snapshots and restores the cursor,
+        // best-effort blocks user input, verifies each field by reading it back
+        // from game memory, retries on mismatch, and aborts if the user grabs the
+        // mouse so stray keystrokes never land in the wrong place.
+        private async Task FillExchange(int wantValue, int haveValue)
+        {
+            if (wantValue <= 0 || haveValue <= 0)
+                return;
+
+            var currencyPanel = GameController.IngameState?.IngameUi?.CurrencyExchangePanel;
+            if (currencyPanel == null || !currencyPanel.IsVisible)
+            {
+                SetStatus("Currency Exchange panel is not open", false);
+                return;
+            }
+
+            var wantedInput = currencyPanel.WantedItemCountInput;
+            var offeredInput = currencyPanel.OfferedItemCountInput;
+            if (wantedInput == null || offeredInput == null)
+            {
+                SetStatus("Input fields not found", false);
+                LogMessage("Cannot fill: Input fields not found");
+                return;
+            }
+
+            var windowOffset = GameController.Window.GetWindowRectangleTimeCache.TopLeft;
+            var offsets = new Vector2(Settings.ClickXOffset.Value, Settings.ClickYOffset.Value);
+            var cursorBefore = Mouse.GetCursorPosition();
+
+            IDisposable mouseBlock = null;
+            IDisposable kbBlock = null;
+            bool aborted = false;
+            bool placeReady = false;
+
+            try
+            {
+                SetStatus("Filling...", true);
+
+                // Best-effort: ask the framework to block the user's real input during
+                // automation. The stock input manager is often a no-op (IsSuccess == false),
+                // so the abort-on-drift check below is the real safety net.
+                mouseBlock = Input.InputManager?.BlockUserMouseInput();
+                kbBlock = Input.InputManager?.BlockUserKeyboardInput();
+
+                bool wantOk = await FillField(wantedInput, wantValue, windowOffset, offsets);
+                bool haveOk = await FillField(offeredInput, haveValue, windowOffset, offsets);
+
+                // Park on Place Order only when both fields are confirmed (or when
+                // verification is off and we can't know otherwise).
+                placeReady = !Settings.VerifyFills.Value || (wantOk && haveOk);
+
+                if (!Settings.VerifyFills.Value)
+                {
+                    SetStatus($"Filled (unverified): {wantValue} : {haveValue}", true);
+                }
+                else if (wantOk && haveOk)
+                {
+                    SetStatus($"Filled OK: {wantValue} : {haveValue}", true);
+                }
+                else
+                {
+                    string which =
+                        (!wantOk ? "Want" : "")
+                        + (!wantOk && !haveOk ? " & " : "")
+                        + (!haveOk ? "Have" : "");
+                    SetStatus($"Could not verify {which} - check the fields and retry", false);
+                }
+
+                LogMessage(
+                    $"Fill want={wantValue} have={haveValue} wantOk={wantOk} haveOk={haveOk}"
+                );
+            }
+            catch (FillAbortedException ex)
+            {
+                aborted = true;
+                SetStatus($"Fill cancelled ({ex.Message})", false);
+            }
+            catch (Exception ex)
+            {
+                SetStatus($"Error: {ex.Message}", false);
+                LogError($"Error during fill: {ex.Message}");
+            }
+            finally
+            {
+                mouseBlock?.Dispose();
+                kbBlock?.Dispose();
+
+                if (aborted)
+                {
+                    // The user grabbed the mouse — leave it under their control.
+                }
+                else if (placeReady && Settings.MoveCursorToPlaceOrder.Value)
+                {
+                    if (
+                        TryGetPlaceOrderButtonPos(
+                            currencyPanel,
+                            windowOffset,
+                            offsets,
+                            out var placePos
+                        )
+                    )
+                    {
+                        // Park the cursor on the Place Order button, ready to confirm.
+                        Mouse.SetPosition(placePos);
+                    }
+                    else
+                    {
+                        // Couldn't locate the button — restore the cursor instead.
+                        Mouse.SetPosition(new Vector2(cursorBefore.X, cursorBefore.Y));
+                        if (Settings.ShowDebugInfo.Value)
+                            LogMessage("Place Order button not found; cursor restored.");
+                    }
+                }
+                else
+                {
+                    // Not a confirmed fill, or parking disabled — restore the cursor.
+                    Mouse.SetPosition(new Vector2(cursorBefore.X, cursorBefore.Y));
+                }
+            }
+        }
+
+        // Locates the Place Order button by finding its "place order" label and taking the
+        // label's parent (the full button), then returns its on-screen center. Validates the
+        // element so a layout change can't silently park the cursor on the wrong spot — returns
+        // false (caller restores the original cursor) if the button can't be found.
+        private bool TryGetPlaceOrderButtonPos(
+            Element panel,
+            Vector2 windowOffset,
+            Vector2 offsets,
+            out Vector2 pos
+        )
+        {
+            pos = default;
+
+            try
+            {
+                // Search the panel first (tight scope); fall back to the panel's root in case the
+                // exposed panel element sits below the button in the tree.
+                var label = FindPlaceOrderLabel(panel) ?? FindPlaceOrderLabel(panel?.Root);
+
+                // The label is a child of the button container; the parent gives the full button rect.
+                var button = label?.Parent ?? label;
+                if (button == null || !button.IsValid || !button.IsVisible)
+                    return false;
+
+                var rect = button.GetClientRectCache;
+                if (rect.Width <= 1 || rect.Height <= 1)
+                    return false;
+
+                pos = rect.Center + windowOffset + offsets;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Element FindPlaceOrderLabel(Element root)
+        {
+            return root?.FindChildRecursive(e =>
+            {
+                var t = e?.TextNoTags;
+                if (string.IsNullOrEmpty(t))
+                    t = e?.Text;
+                return !string.IsNullOrEmpty(t)
+                    && t.Trim().Equals(PlaceOrderLabelText, StringComparison.OrdinalIgnoreCase);
+            });
+        }
+
+        // Clicks a field, clears it, types the value, then (if verification is on) reads
+        // the field back from memory and retries the whole sequence until it matches or
+        // we run out of attempts. Returns true if the field holds the target value.
+        private async Task<bool> FillField(
+            Element field,
+            int value,
+            Vector2 windowOffset,
+            Vector2 offsets
+        )
+        {
+            bool verify = Settings.VerifyFills.Value;
+            int maxAttempts = verify ? Math.Max(1, Settings.MaxFillRetries.Value) : 1;
+            string target = value.ToString();
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                var pos = field.GetClientRectCache.Center + windowOffset + offsets;
+
+                // Double-click: the first click returns focus to the game window, the
+                // second actually focuses the field (documented overlay-focus workaround).
+                await ClickAt(pos);
+                await Task.Delay(ClickFocusDelayMs);
+                await ClickAt(pos);
+                await Task.Delay(ClickFocusDelayMs);
+                EnsureCursorHeld(pos);
+
+                for (int i = 0; i < ClearBackspaces; i++)
+                    await Keyboard.KeyPress(Keys.Back);
+
+                await Keyboard.Type(target);
+
+                if (!verify)
+                {
+                    await Task.Delay(150); // settle before the next field (legacy timing)
+                    return true;
+                }
+
+                if (await WaitForFieldValue(field, value, pos))
+                    return true;
+
+                // Mismatch — loop to re-click, re-clear and re-type.
+            }
+
+            return false;
+        }
+
+        private static async Task ClickAt(Vector2 pos)
+        {
+            await Mouse.MoveMouse(pos);
+            await Mouse.LeftDown();
+            await Mouse.LeftUp();
+        }
+
+        // Poll-until-ready: wait for game memory to reflect the typed value, aborting if
+        // the user grabs the mouse. Returns false on timeout so the caller can retry.
+        private async Task<bool> WaitForFieldValue(Element field, int target, Vector2 heldPos)
+        {
+            int elapsed = 0;
+            while (elapsed < VerifyTimeoutMs)
+            {
+                EnsureCursorHeld(heldPos);
+
+                var read = ReadFieldNumber(field);
+                if (read.HasValue && read.Value == target)
+                    return true;
+
+                await Task.Delay(VerifyPollMs);
+                elapsed += VerifyPollMs;
+            }
+
+            return false;
+        }
+
+        // Reads the numeric value currently shown in an input field. The digits may live
+        // on the element itself or on a child, so we check both, defensively.
+        private static int? ReadFieldNumber(Element field)
+        {
+            if (field == null)
+                return null;
+
+            try
+            {
+                string raw = FirstNonEmpty(field.TextNoTags, field.Text);
+
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    var child = field.FindChildRecursive(e =>
+                    {
+                        var t = e?.Text;
+                        return !string.IsNullOrWhiteSpace(t) && t.Any(char.IsDigit);
+                    });
+                    if (child != null)
+                        raw = FirstNonEmpty(child.TextNoTags, child.Text);
+                }
+
+                if (string.IsNullOrWhiteSpace(raw))
+                    return null;
+
+                var digits = new string(raw.Where(char.IsDigit).ToArray());
+                if (digits.Length == 0)
+                    return null;
+
+                return int.TryParse(digits, out int val) ? val : (int?)null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string FirstNonEmpty(string a, string b) =>
+            !string.IsNullOrWhiteSpace(a) ? a : b;
+
+        // Throws if the cursor has drifted from where we last placed it (user grabbed the
+        // mouse). No-op when the abort-on-move setting is disabled.
+        private void EnsureCursorHeld(Vector2 expected)
+        {
+            if (!Settings.AbortOnMouseMove.Value)
+                return;
+
+            var cur = Mouse.GetCursorPosition();
+            int dx = cur.X - (int)expected.X;
+            int dy = cur.Y - (int)expected.Y;
+            if (dx * dx + dy * dy > CursorDriftThresholdSq)
+                throw new FillAbortedException("you moved the mouse");
+        }
+
+        private void RenderFillStatus()
+        {
+            if (_isProcessing)
+            {
+                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1.0f, 0.85f, 0.2f, 1.0f));
+                ImGui.TextWrapped("Filling exchange window...");
+                ImGui.PopStyleColor();
+                return;
+            }
+
+            if (string.IsNullOrEmpty(_statusMessage))
+                return;
+
+            var color = _statusOk
+                ? new Vector4(0.2f, 1.0f, 0.2f, 1.0f)
+                : new Vector4(1.0f, 0.4f, 0.4f, 1.0f);
+            ImGui.PushStyleColor(ImGuiCol.Text, color);
+            ImGui.TextWrapped(_statusMessage);
+            ImGui.PopStyleColor();
+        }
+
+        private void SetStatus(string message, bool ok)
+        {
+            _statusMessage = message;
+            _statusOk = ok;
+        }
+
+        private sealed class FillAbortedException : Exception
+        {
+            public FillAbortedException(string message)
+                : base(message) { }
+        }
+
+        private void Calculate()
+        {
+            _hasValidResult = false;
+            _errorMessage = "";
+
+            if (string.IsNullOrWhiteSpace(_amountInput) || string.IsNullOrWhiteSpace(_ratioInput))
+            {
+                return;
+            }
+
+            // Parse amount
+            if (!int.TryParse(_amountInput, out int amount) || amount <= 0)
+            {
+                _errorMessage = "Currency amount should be a positive integer";
+                return;
+            }
+
+            // Parse ratio (Want:Have format)
+            var ratioParts = ParseRatio(_ratioInput);
+            if (ratioParts == null)
+            {
+                _errorMessage = "Error parsing ratio. Use format like 1:3 or 2:5";
+                return;
+            }
+
+            double wantPart = ratioParts.Value.want;
+            double havePart = ratioParts.Value.have;
+
+            if (wantPart <= 0 || havePart <= 0)
+            {
+                _errorMessage = "Ratio values must be positive";
+                return;
+            }
+
+            // Calculate the ratio as a price (want/have)
+            double ratio = wantPart / havePart;
+
+            // Calculate max trade
+            var result = CalculateMaxTrade(amount, ratio);
+
+            if (result.want > 0 && result.have > 0)
+            {
+                _calculatedWant = result.want;
+                _calculatedHave = result.have;
+                _hasValidResult = true;
+            }
+            else
+            {
+                _errorMessage = "No valid trade possible";
+            }
+        }
+
+        private (double want, double have)? ParseRatio(string ratioStr)
+        {
+            if (string.IsNullOrWhiteSpace(ratioStr))
+                return null;
+
+            try
+            {
+                ratioStr = ratioStr.Trim();
+
+                // Check for colon separator (Want:Have format)
+                if (ratioStr.Contains(':'))
+                {
+                    var parts = ratioStr.Split(':');
+                    if (parts.Length != 2)
+                        return null;
+
+                    if (
+                        double.TryParse(parts[0].Trim(), out double want)
+                        && double.TryParse(parts[1].Trim(), out double have)
+                    )
+                    {
+                        return (want, have);
+                    }
+                }
+                else
+                {
+                    // Try to parse as single expression (e.g., "1.5" or "3/2")
+                    // Check if it contains only valid characters for math expressions
+                    if (
+                        !System.Text.RegularExpressions.Regex.IsMatch(
+                            ratioStr,
+                            @"^[\d\s.\/+\-*()]+$"
+                        )
+                    )
+                    {
+                        return null;
+                    }
+
+                    // Use DataTable to evaluate the expression
+                    var table = new DataTable();
+                    var result = table.Compute(ratioStr, null);
+
+                    if (result is decimal || result is double || result is int)
+                    {
+                        double ratio = Convert.ToDouble(result);
+                        if (double.IsFinite(ratio) && ratio > 0)
+                        {
+                            // Convert single ratio to Want:Have format (1:ratio)
+                            return (1, ratio);
+                        }
+                    }
+                }
+
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private (int want, int have) CalculateMaxTrade(int totalAmount, double ratio)
+        {
+            // ratio = want / have
+            // We need to find the largest 'have' value where (have * ratio) is a whole number
+
+            for (int have = totalAmount; have > 0; have--)
+            {
+                double want = have * ratio;
+
+                // Check if want is effectively a whole number (accounting for floating point precision)
+                if (Math.Abs(want - Math.Round(want)) < 0.000001)
+                {
+                    int wantRounded = (int)Math.Round(want);
+
+                    if (wantRounded > 0)
+                    {
+                        return (want: wantRounded, have: have);
+                    }
+                }
+            }
+
+            return (want: 0, have: 0);
+        }
+
+    }
+}
