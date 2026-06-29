@@ -445,7 +445,10 @@ namespace CurrencyRatioExchange
 
                     foreach (var item in inventory.Items)
                     {
-                        if (item == null)
+                        // Skip stale/freed slots: a reused entity can transiently still
+                        // translate to the right base name while its components are mid-update,
+                        // which is what makes the count occasionally read one too high.
+                        if (item == null || !item.IsValid || item.Address == 0)
                             continue;
 
                         var baseItemType = GameController.Files.BaseItemTypes.Translate(
@@ -453,9 +456,13 @@ namespace CurrencyRatioExchange
                         );
                         if (baseItemType?.BaseName == targetBaseName)
                         {
+                            // Real currency is always stackable, so a missing Stack here means a
+                            // bad/transient read — don't invent a count of 1 (the old `?? 1`).
                             var stackComp =
                                 item.GetComponent<ExileCore2.PoEMemory.Components.Stack>();
-                            amount += stackComp?.Size ?? 1;
+                            if (stackComp == null)
+                                continue;
+                            amount += stackComp.Size;
                         }
                     }
                 }
