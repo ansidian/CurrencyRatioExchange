@@ -7,6 +7,7 @@ A Path of Exile 2 plugin for ExileCore2 that provides an in-game calculator over
 - **Want:Have Ratio Format**: Use in-game ratio format like `1:3` or `2:5`
 - **Flexible Input**: Also supports expressions like `1.5`, `3/2`, etc.
 - **Maximum Whole Trade Calculation**: Finds the largest possible trade with no leftover currency
+- **Exact Buy Amount Calculation**: Enter how much you want to buy and calculate how much you need to offer
 - **In-Game Overlay**: Calculator appears next to the Currency Exchange panel when open
 - **One-Click Fill**: Button to automatically fill the exchange fields with calculated values
 - **Real-Time Calculation**: Updates results as you type
@@ -37,7 +38,9 @@ When you have a certain amount of currency and want to trade at a specific ratio
 
 ### Using the Calculator
 
-1. **Enter Currency Amount**: Type the total amount you have
+1. **Choose Calculation Mode**:
+   - **Max from owned amount**: Type the total amount you have
+   - **Buy exact amount**: Type how much you want to buy
 
 2. **Enter Ratio** in Want:Have format:
    - `1:3` = Want 1 for every 3 you have
@@ -56,6 +59,16 @@ When you have a certain amount of currency and want to trade at a specific ratio
 | `2:5` | 2 wanted per 5 offered | 400 : 1000 |
 | `1.5` | 1.5 wanted per 1 offered | 1000 : 666 |
 | `3/2` | Same as 1.5:1 | 1000 : 666 |
+
+### Exact Buy Amount Example
+
+If you want to buy exactly 100 currency at a `1:3` ratio:
+- Mode: **Buy exact amount**
+- Amount to Buy: **100**
+- Ratio: **1:3**
+- Result: **100 : 300**
+
+For decimal market ratios, the offered amount is rounded up to the nearest whole number. For example, buying 10 at `1:4.04` becomes `10 : 41`.
 
 ## Settings
 
