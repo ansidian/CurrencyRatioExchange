@@ -26,6 +26,7 @@ namespace CurrencyRatioExchange
         private string _errorMessage = "";
         private bool _hasValidResult = false;
         private volatile bool _isProcessing = false;
+        private bool _calculateExactWantedAmount = false;
 
         // Fill status feedback (written from the fill task, read on the render thread)
         private volatile string _statusMessage = "";
@@ -96,8 +97,23 @@ namespace CurrencyRatioExchange
                 )
             )
             {
+                ImGui.Text("Calculation Mode:");
+                if (ImGui.RadioButton("Max from owned amount", !_calculateExactWantedAmount))
+                {
+                    _calculateExactWantedAmount = false;
+                    Calculate();
+                }
+                ImGui.SameLine();
+                if (ImGui.RadioButton("Buy exact amount", _calculateExactWantedAmount))
+                {
+                    _calculateExactWantedAmount = true;
+                    Calculate();
+                }
+
                 // Amount Input
-                ImGui.Text("Currency Amount:");
+                ImGui.Text(
+                    _calculateExactWantedAmount ? "Amount to Buy (Want):" : "Currency Amount:"
+                );
                 ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - 50);
                 if (ImGui.InputText("##amount", ref _amountInput, 32))
                 {
@@ -105,7 +121,7 @@ namespace CurrencyRatioExchange
                 }
                 ImGui.SameLine();
                 int availableForFill = GetOfferedCurrencyAmount();
-                if (availableForFill > 0)
+                if (!_calculateExactWantedAmount && availableForFill > 0)
                 {
                     if (ImGui.Button("Fill##fillAmount", new Vector2(42, 0)))
                     {
@@ -124,7 +140,11 @@ namespace CurrencyRatioExchange
                     ImGui.EndDisabled();
                     if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
                     {
-                        ImGui.SetTooltip("Select an offered currency first");
+                        ImGui.SetTooltip(
+                            _calculateExactWantedAmount
+                                ? "Fill is only available in max amount mode"
+                                : "Select an offered currency first"
+                        );
                     }
                 }
 
@@ -198,7 +218,9 @@ namespace CurrencyRatioExchange
                 ImGui.Spacing();
                 ImGui.Separator();
                 ImGui.TextWrapped(
-                    "Enter your currency amount and the ratio (Want:Have). The calculator finds the maximum whole trade with no leftovers."
+                    _calculateExactWantedAmount
+                        ? "Enter how much you want to buy and the ratio (Want:Have). The calculator shows how much you need to offer."
+                        : "Enter your currency amount and the ratio (Want:Have). The calculator finds the maximum whole trade with no leftovers."
                 );
 
                 ImGui.Spacing();
@@ -292,10 +314,19 @@ namespace CurrencyRatioExchange
                 // Quick fill buttons
                 ImGui.PushID(index);
 
-                // Calculate actual fill amounts based on available currency
+                // Calculate actual fill amounts.
                 // - give = what we want to receive
                 // - get = what we have to offer
-                var (matchWant, matchHave) = CalculateFillAmounts(give, get, availableAmount);
+                bool hasWantedAmount = TryGetWantedAmountInput(out int wantedAmount);
+                var (matchWant, matchHave) =
+                    _calculateExactWantedAmount && hasWantedAmount
+                        ? CalculateApproximateWantedTrade(
+                            wantedAmount,
+                            give,
+                            get,
+                            availableAmount
+                        )
+                        : CalculateFillAmounts(give, get, availableAmount);
 
                 if (matchHave > 0 && ImGui.SmallButton("Match"))
                 {
@@ -317,11 +348,15 @@ namespace CurrencyRatioExchange
 
                     // Calculate undercut: reduce 'give' (what we receive) by the percentage
                     double undercutGive = give * (1.0 - percent / 100.0);
-                    var (undercutWant, undercutHave) = CalculateFillAmounts(
-                        undercutGive,
-                        get,
-                        availableAmount
-                    );
+                    var (undercutWant, undercutHave) =
+                        _calculateExactWantedAmount && hasWantedAmount
+                            ? CalculateApproximateWantedTrade(
+                                wantedAmount,
+                                undercutGive,
+                                get,
+                                availableAmount
+                            )
+                            : CalculateFillAmounts(undercutGive, get, availableAmount);
 
                     if (undercutHave > 0 && ImGui.SmallButton($"{percent}%"))
                     {
@@ -507,6 +542,28 @@ namespace CurrencyRatioExchange
             }
 
             return (0, 0);
+        }
+
+        private bool TryGetWantedAmountInput(out int wantedAmount)
+        {
+            return int.TryParse(_amountInput, out wantedAmount) && wantedAmount > 0;
+        }
+
+        private (int want, int have) CalculateApproximateWantedTrade(
+            int wantedAmount,
+            double wantPerUnit,
+            double havePerUnit,
+            int availableAmount
+        )
+        {
+            if (wantedAmount <= 0 || wantPerUnit <= 0 || havePerUnit <= 0 || availableAmount <= 0)
+                return (0, 0);
+
+            int haveRoundedUp = (int)Math.Ceiling(wantedAmount * havePerUnit / wantPerUnit);
+            if (haveRoundedUp <= 0 || haveRoundedUp > availableAmount)
+                return (0, 0);
+
+            return (wantedAmount, haveRoundedUp);
         }
 
         private void QueueQuickFill(int want, int have)
@@ -881,11 +938,9 @@ namespace CurrencyRatioExchange
                 return;
             }
 
-            // Calculate the ratio as a price (want/have)
-            double ratio = wantPart / havePart;
-
-            // Calculate max trade
-            var result = CalculateMaxTrade(amount, ratio);
+            var result = _calculateExactWantedAmount
+                ? CalculateExactWantedTrade(amount, wantPart, havePart)
+                : CalculateMaxTrade(amount, wantPart / havePart);
 
             if (result.want > 0 && result.have > 0)
             {
@@ -980,6 +1035,19 @@ namespace CurrencyRatioExchange
                     }
                 }
             }
+
+            return (want: 0, have: 0);
+        }
+
+        private (int want, int have) CalculateExactWantedTrade(
+            int wantedAmount,
+            double wantPart,
+            double havePart
+        )
+        {
+            int haveRoundedUp = (int)Math.Ceiling(wantedAmount * havePart / wantPart);
+            if (haveRoundedUp > 0)
+                return (want: wantedAmount, have: haveRoundedUp);
 
             return (want: 0, have: 0);
         }
